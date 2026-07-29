@@ -184,21 +184,29 @@ pub(crate) fn encode_local_pane_graphics(
 ) -> Vec<u8> {
     let mode_ok = app.mode == Mode::Terminal;
     let cell_ok = cell_size.is_known();
+    // Kitty placements composite above the text layer in the host terminal, so
+    // an open popup (rendered as text cells on top of the panes) would be
+    // overdrawn by underlying pane images. Suppress all graphics while a popup
+    // is open and actively delete anything previously placed.
+    let popup_open = app.popup_pane.is_some();
     tracing::debug!(
         mode_ok,
         cell_ok,
+        popup_open,
         cell_width_px = cell_size.width_px,
         cell_height_px = cell_size.height_px,
         active = ?app.active,
         pane_infos_len = surface.pane_infos.len(),
         "paint_local_pane_graphics entry"
     );
-    if !mode_ok || !cell_ok {
+    if !mode_ok || !cell_ok || popup_open {
         tracing::debug!(
             reason = if !mode_ok {
                 "not terminal mode"
-            } else {
+            } else if !cell_ok {
                 "cell size unknown"
+            } else {
+                "popup open"
             },
             "paint_local_pane_graphics early return"
         );
@@ -239,7 +247,7 @@ pub(crate) fn has_visible_pane_graphics(
     surface: crate::ui::TabSurfaceView<'_>,
     cell_size: HostCellSize,
 ) -> bool {
-    if app.mode != Mode::Terminal || !cell_size.is_known() {
+    if app.mode != Mode::Terminal || !cell_size.is_known() || app.popup_pane.is_some() {
         return false;
     }
 
@@ -1048,6 +1056,164 @@ mod tests {
             pane_id: placement.pane_id,
         };
         placement
+    }
+
+    fn app_with_visible_pane_graphics() -> AppState {
+        let mut app = AppState::test_new();
+        let workspace = crate::workspace::Workspace::test_new("graphics");
+        let pane_id = workspace
+            .active_tab()
+            .expect("test workspace has active tab")
+            .root_pane;
+
+        app.workspaces = vec![workspace];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.view.terminal_area = Rect::new(0, 0, 40, 20);
+        app.view.pane_infos = vec![PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 40, 20),
+            inner_rect: Rect::new(0, 0, 40, 20),
+            scrollbar_rect: None,
+            borders: ratatui::widgets::Borders::NONE,
+            is_focused: true,
+        }];
+        app.pane_graphics_layers.insert(
+            pane_id,
+            crate::app::state::PaneGraphicsLayer::new(
+                crate::api::schema::PaneGraphicsFormat::Rgba,
+                40,
+                20,
+                vec![255; 40 * 20 * 4],
+                crate::api::schema::PaneGraphicsPlacementParams::default(),
+            ),
+        );
+        app
+    }
+
+    fn open_test_popup(app: &mut AppState) {
+        app.popup_pane = Some(crate::app::state::PopupPaneState {
+            pane_id: PaneId::alloc(),
+            terminal_id: crate::terminal::TerminalId::alloc(),
+            width: None,
+            height: None,
+        });
+    }
+
+    fn known_cell_size() -> HostCellSize {
+        HostCellSize {
+            width_px: 10,
+            height_px: 20,
+        }
+    }
+
+    fn encode_for_test(app: &AppState, cache: &mut HostGraphicsCache) -> String {
+        String::from_utf8_lossy(&encode_local_pane_graphics(
+            app,
+            &TerminalRuntimeRegistry::new(),
+            app.view.tab_surface(),
+            known_cell_size(),
+            cache,
+        ))
+        .into_owned()
+    }
+
+    #[test]
+    fn popup_visible_with_empty_cache_suppresses_tiled_graphics() {
+        let mut app = app_with_visible_pane_graphics();
+        open_test_popup(&mut app);
+        let mut cache = HostGraphicsCache::default();
+
+        let bytes = encode_for_test(&app, &mut cache);
+
+        assert!(bytes.is_empty(), "popup must suppress cold-cache upload");
+        assert!(!bytes.contains("a=t,t=d"), "must not upload image data");
+        assert!(!bytes.contains("a=p,"), "must not place tiled image");
+        assert!(cache.is_empty(), "popup must leave cold cache empty");
+    }
+
+    #[test]
+    fn opening_popup_deletes_cached_tiled_graphics() {
+        let mut app = app_with_visible_pane_graphics();
+        let mut cache = HostGraphicsCache::default();
+        let initial = encode_for_test(&app, &mut cache);
+        assert!(initial.contains("a=t,t=d"), "setup uploads image data");
+        assert!(initial.contains("a=p,"), "setup places image");
+        assert!(!cache.is_empty(), "setup populates host graphics cache");
+
+        open_test_popup(&mut app);
+        let popup = encode_for_test(&app, &mut cache);
+
+        assert!(
+            popup.contains("a=d,d=I"),
+            "opening popup must delete cached host images"
+        );
+        assert!(
+            !popup.contains("a=t,t=d"),
+            "must not upload while popup is open"
+        );
+        assert!(
+            !popup.contains("a=p,"),
+            "must not place while popup is open"
+        );
+        assert!(cache.is_empty(), "popup must clear host graphics cache");
+    }
+
+    #[test]
+    fn closing_popup_restores_tiled_graphics() {
+        let mut app = app_with_visible_pane_graphics();
+        let mut cache = HostGraphicsCache::default();
+        assert!(encode_for_test(&app, &mut cache).contains("a=p,"));
+
+        open_test_popup(&mut app);
+        let popup = encode_for_test(&app, &mut cache);
+        assert!(popup.contains("a=d,d=I"));
+
+        let still_open = encode_for_test(&app, &mut cache);
+        assert!(
+            still_open.is_empty(),
+            "open popup with empty cache is a no-op"
+        );
+
+        app.popup_pane = None;
+        let restored = encode_for_test(&app, &mut cache);
+
+        assert!(restored.contains("a=t,t=d"), "closing popup reuploads data");
+        assert!(
+            restored.contains("a=p,"),
+            "closing popup restores placement"
+        );
+        assert!(!cache.is_empty(), "closing popup repopulates cache");
+    }
+
+    #[test]
+    fn visible_graphics_query_is_false_while_popup_is_open() {
+        let mut app = app_with_visible_pane_graphics();
+        let registry = TerminalRuntimeRegistry::new();
+
+        assert!(has_visible_pane_graphics(
+            &app,
+            &registry,
+            app.view.tab_surface(),
+            known_cell_size(),
+        ));
+
+        open_test_popup(&mut app);
+        assert!(!has_visible_pane_graphics(
+            &app,
+            &registry,
+            app.view.tab_surface(),
+            known_cell_size(),
+        ));
+
+        app.popup_pane = None;
+        assert!(has_visible_pane_graphics(
+            &app,
+            &registry,
+            app.view.tab_surface(),
+            known_cell_size(),
+        ));
     }
 
     #[test]
