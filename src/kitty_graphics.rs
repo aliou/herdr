@@ -215,10 +215,12 @@ pub(crate) fn encode_local_pane_graphics(
 
     let mut bytes = Vec::new();
     let view_changed = cache.update_view(view_key);
+    let occluder = crate::ui::popup_pane_rects(app, app.view.terminal_area).map(|(outer, _)| outer);
     encode_graphics_update(
         &mut bytes,
         &placements,
         view_changed,
+        occluder,
         &mut cache.images,
         &mut cache.placements,
         &mut cache.sources,
@@ -296,6 +298,7 @@ fn encode_graphics_update(
     bytes: &mut Vec<u8>,
     placements: &[HostPlacement],
     view_changed: bool,
+    occluder: Option<Rect>,
     host_images: &mut HashMap<u32, ImageSignature>,
     host_placements: &mut HashMap<(u32, u32), PlacementSignature>,
     sources: &mut HashMap<HostSourceKey, u32>,
@@ -344,13 +347,20 @@ fn encode_graphics_update(
         let Some((clipped, format_code)) = clipped else {
             continue;
         };
+        let fragments = match occluder {
+            Some(occluder) => subtract_occluder(clipped, occluder),
+            None => Vec::from([clipped]),
+        };
+        if fragments.is_empty() {
+            // Fully occluded by an overlay (for example, a popup pane); drop it
+            // for this frame. Stale cleanup removes any previously emitted
+            // placement for it.
+            continue;
+        }
+
         let host_id = host_image_id(placement.pane_id, &placement.placement);
-        let host_placement_id = host_placement_id(placement.source_key, &placement.placement);
+        let base_placement_id = host_placement_id(placement.source_key, &placement.placement);
         let image_signature = image_signature(placement, format_code);
-        let placement_signature =
-            placement_signature(clipped, placement.placement.z, placement.scrollback_offset);
-        let placement_key = (host_id, host_placement_id);
-        current_placements.insert(placement_key);
 
         match host_images.get(&host_id).copied() {
             Some(existing) if existing == image_signature => {}
@@ -387,30 +397,43 @@ fn encode_graphics_update(
             host_id,
         );
 
-        // A different view can repaint the same cells with text or overlays and
-        // leave the host-side Kitty placement state out of sync with this cache.
-        // Re-emit the placement even when its geometry signature is unchanged.
-        match host_placements.get_mut(&placement_key) {
-            Some(existing) if !view_changed && *existing == placement_signature => {}
-            Some(existing) => {
-                encode_display_placement(
-                    bytes,
-                    clipped,
-                    host_id,
-                    host_placement_id,
-                    placement.placement.z,
-                );
-                *existing = placement_signature;
-            }
-            None => {
-                encode_display_placement(
-                    bytes,
-                    clipped,
-                    host_id,
-                    host_placement_id,
-                    placement.placement.z,
-                );
-                host_placements.insert(placement_key, placement_signature);
+        let fragment_count = fragments.len();
+        for (index, fragment) in fragments.into_iter().enumerate() {
+            let host_placement_id = if fragment_count > 1 {
+                derived_placement_id(base_placement_id, index as u32)
+            } else {
+                base_placement_id
+            };
+            let placement_signature =
+                placement_signature(fragment, placement.placement.z, placement.scrollback_offset);
+            let placement_key = (host_id, host_placement_id);
+            current_placements.insert(placement_key);
+
+            // A different view can repaint the same cells with text or overlays and
+            // leave the host-side Kitty placement state out of sync with this cache.
+            // Re-emit the placement even when its geometry signature is unchanged.
+            match host_placements.get_mut(&placement_key) {
+                Some(existing) if !view_changed && *existing == placement_signature => {}
+                Some(existing) => {
+                    encode_display_placement(
+                        bytes,
+                        fragment,
+                        host_id,
+                        host_placement_id,
+                        placement.placement.z,
+                    );
+                    *existing = placement_signature;
+                }
+                None => {
+                    encode_display_placement(
+                        bytes,
+                        fragment,
+                        host_id,
+                        host_placement_id,
+                        placement.placement.z,
+                    );
+                    host_placements.insert(placement_key, placement_signature);
+                }
             }
         }
     }
@@ -929,6 +952,103 @@ fn scale_pixels(value: u32, source: u32, dest: u32) -> u32 {
     ((value as u64).saturating_mul(source as u64) / dest.max(1) as u64).min(u32::MAX as u64) as u32
 }
 
+/// Subtracts an occluding screen rectangle (such as a popup pane) from an
+/// already-clipped placement, returning the visible fragments in reading order.
+///
+/// The complement of `occluder ∩ rect` is at most four bands: a top strip, a
+/// bottom strip, a left strip, and a right strip. Each fragment's source-image
+/// crop is remapped with the same linear cell-to-pixel mapping the placement
+/// already uses, so the rendered pixels do not shift.
+///
+/// Returns a single element when the occluder does not overlap the placement,
+/// and an empty vector when the occluder fully covers it.
+fn subtract_occluder(clipped: ClippedPlacement, occluder: Rect) -> Vec<ClippedPlacement> {
+    let rect = Rect::new(
+        clipped.x,
+        clipped.y,
+        clipped.cols.min(u16::MAX as u32) as u16,
+        clipped.rows.min(u16::MAX as u32) as u16,
+    );
+    let inter = rect.intersection(occluder);
+    if inter.width == 0 || inter.height == 0 {
+        return vec![clipped];
+    }
+
+    let mut bands = Vec::new();
+    if inter.y > rect.y {
+        bands.push(Rect::new(rect.x, rect.y, rect.width, inter.y - rect.y));
+    }
+    let bottom_start = inter.y + inter.height;
+    let bottom_end = rect.y + rect.height;
+    if bottom_start < bottom_end {
+        bands.push(Rect::new(
+            rect.x,
+            bottom_start,
+            rect.width,
+            bottom_end - bottom_start,
+        ));
+    }
+    if inter.x > rect.x {
+        bands.push(Rect::new(rect.x, inter.y, inter.x - rect.x, inter.height));
+    }
+    let right_start = inter.x + inter.width;
+    let right_end = rect.x + rect.width;
+    if right_start < right_end {
+        bands.push(Rect::new(
+            right_start,
+            inter.y,
+            right_end - right_start,
+            inter.height,
+        ));
+    }
+
+    bands
+        .into_iter()
+        .map(|band| {
+            let local_x = u32::from(band.x - rect.x);
+            let local_y = u32::from(band.y - rect.y);
+            let band_cols = u32::from(band.width);
+            let band_rows = u32::from(band.height);
+
+            let source_start_x =
+                clipped.source_x + scale_pixels(local_x, clipped.source_width, clipped.cols);
+            let source_end_x = clipped.source_x
+                + scale_pixels(local_x + band_cols, clipped.source_width, clipped.cols);
+            let source_start_y =
+                clipped.source_y + scale_pixels(local_y, clipped.source_height, clipped.rows);
+            let source_end_y = clipped.source_y
+                + scale_pixels(local_y + band_rows, clipped.source_height, clipped.rows);
+
+            ClippedPlacement {
+                x: band.x,
+                y: band.y,
+                cols: band_cols,
+                rows: band_rows,
+                source_x: source_start_x,
+                source_y: source_start_y,
+                source_width: source_end_x.saturating_sub(source_start_x).max(1),
+                source_height: source_end_y.saturating_sub(source_start_y).max(1),
+                x_offset: if local_x == 0 { clipped.x_offset } else { 0 },
+                y_offset: if local_y == 0 { clipped.y_offset } else { 0 },
+            }
+        })
+        .collect()
+}
+
+/// Derives a stable, distinct Kitty placement id for an occlusion fragment of
+/// the placement identified by `base`.
+///
+/// Fragment ids live in a range disjoint from `host_placement_id`'s `[1,
+/// 900_000]`. Two placements can share a host image (same pane and identical
+/// image content), so a fragment id must never collide with another placement's
+/// base id for that image. The disjoint range makes that impossible regardless
+/// of how the base id hashes.
+fn derived_placement_id(base: u32, index: u32) -> u32 {
+    const FRAGMENT_PLACEMENT_ID_BASE: u32 = 1_000_001;
+    let mixed = base.wrapping_add((index + 1).wrapping_mul(0x9E3779B1u32));
+    FRAGMENT_PLACEMENT_ID_BASE + (mixed % 900_000)
+}
+
 fn image_signature(placement: &HostPlacement, format_code: u32) -> ImageSignature {
     ImageSignature {
         image_width: placement.placement.image_width,
@@ -1075,6 +1195,34 @@ mod tests {
     }
 
     #[test]
+    fn fragment_placement_ids_never_collide_with_base_placement_ids() {
+        // Base placement ids occupy [1, 900_000]; fragments must live outside
+        // that range so a split placement cannot clash with another placement
+        // sharing the same host image.
+        for base in [1_u32, 2, 1000, 899_999, 900_000] {
+            for index in 0_u32..4 {
+                let fragment = derived_placement_id(base, index);
+                assert!(
+                    fragment >= 1_000_001,
+                    "fragment {fragment} below disjoint range"
+                );
+                assert!(
+                    fragment <= 1_900_000,
+                    "fragment {fragment} above disjoint range"
+                );
+            }
+        }
+
+        // Fragments of the same base are mutually distinct.
+        let base = 123_456;
+        let ids: Vec<u32> = (0..4).map(|i| derived_placement_id(base, i)).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "fragment ids must be distinct");
+    }
+
+    #[test]
     fn pane_graphics_image_ids_are_disjoint_from_terminal_image_ids() {
         let placement = test_placement(0, 0);
         let signature = image_signature(&placement, kitty_format_code(placement.placement.format));
@@ -1109,6 +1257,161 @@ mod tests {
         assert_eq!(clipped.rows, 2);
         assert_eq!(clipped.source_x, 10);
         assert_eq!(clipped.source_y, 10);
+    }
+
+    fn fragment_placement(x: u16, y: u16, cols: u32, rows: u32) -> ClippedPlacement {
+        // 1:1 cell-to-source mapping so source remapping is easy to assert.
+        ClippedPlacement {
+            x,
+            y,
+            cols,
+            rows,
+            source_x: 0,
+            source_y: 0,
+            source_width: cols,
+            source_height: rows,
+            x_offset: 0,
+            y_offset: 0,
+        }
+    }
+
+    #[test]
+    fn subtract_occluder_without_overlap_returns_original() {
+        let clipped = fragment_placement(0, 0, 10, 10);
+        let out = subtract_occluder(clipped, Rect::new(20, 20, 5, 5));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].x, 0);
+        assert_eq!(out[0].y, 0);
+        assert_eq!(out[0].cols, 10);
+        assert_eq!(out[0].rows, 10);
+    }
+
+    #[test]
+    fn subtract_occluder_fully_covered_returns_empty() {
+        let clipped = fragment_placement(0, 0, 4, 4);
+        assert!(subtract_occluder(clipped, Rect::new(0, 0, 4, 4)).is_empty());
+        assert!(subtract_occluder(clipped, Rect::new(0, 0, 9, 9)).is_empty());
+    }
+
+    #[test]
+    fn subtract_occluder_center_hole_yields_four_aligned_bands() {
+        // Screen 0..10 x 0..10 with a 1:1 source mapping; occluder cuts out the
+        // 4x4 center (cols/rows 3..7), leaving a ring.
+        let clipped = fragment_placement(0, 0, 10, 10);
+        let out = subtract_occluder(clipped, Rect::new(3, 3, 4, 4));
+        assert_eq!(out.len(), 4);
+
+        let total_cells: u64 = out.iter().map(|f| f.cols as u64 * f.rows as u64).sum();
+        assert_eq!(total_cells, 100 - 16, "bands cover the un-occluded ring");
+
+        // Reading order: top band, bottom band, left band, right band.
+        let top = out[0];
+        assert_eq!((top.x, top.y, top.cols, top.rows), (0, 0, 10, 3));
+        assert_eq!((top.source_x, top.source_width), (0, 10));
+        assert_eq!((top.source_y, top.source_height), (0, 3));
+
+        let bottom = out[1];
+        assert_eq!(
+            (bottom.x, bottom.y, bottom.cols, bottom.rows),
+            (0, 7, 10, 3)
+        );
+        assert_eq!((bottom.source_y, bottom.source_height), (7, 3));
+
+        let left = out[2];
+        assert_eq!((left.x, left.y, left.cols, left.rows), (0, 3, 3, 4));
+        assert_eq!((left.source_x, left.source_width), (0, 3));
+
+        let right = out[3];
+        assert_eq!((right.x, right.y, right.cols, right.rows), (7, 3, 3, 4));
+        assert_eq!((right.source_x, right.source_width), (7, 3));
+    }
+
+    #[test]
+    fn occluded_placement_splits_into_fragments_then_cleans_up() {
+        let mut images = HashMap::new();
+        let mut placements = HashMap::new();
+        let mut sources = HashMap::new();
+        let mut bytes = Vec::new();
+        let placement = test_placement(0, 0); // clipped screen 0..3 x 0..3
+
+        // Occluder covers only the center cell, punching a hole in the placement.
+        encode_graphics_update(
+            &mut bytes,
+            &[placement],
+            false,
+            Some(Rect::new(1, 1, 1, 1)),
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
+        let emitted = String::from_utf8_lossy(&bytes);
+        assert_eq!(
+            emitted.matches("a=p").count(),
+            4,
+            "hole splits into 4 fragments"
+        );
+        assert_eq!(placements.len(), 4);
+
+        // Closing the occluder re-emits a single placement and deletes fragments.
+        bytes.clear();
+        let same = test_placement(0, 0);
+        encode_graphics_update(
+            &mut bytes,
+            &[same],
+            false,
+            None,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
+        let after = String::from_utf8_lossy(&bytes);
+        assert_eq!(after.matches("a=p").count(), 1);
+        assert_eq!(
+            after.matches("a=d,d=i").count(),
+            4,
+            "fragment placements are deleted"
+        );
+        assert_eq!(placements.len(), 1);
+    }
+
+    #[test]
+    fn fully_occluded_placement_emits_nothing_and_clears_prior() {
+        let mut images = HashMap::new();
+        let mut placements = HashMap::new();
+        let mut sources = HashMap::new();
+        let mut bytes = Vec::new();
+        let placement = test_placement(0, 0);
+
+        encode_graphics_update(
+            &mut bytes,
+            &[placement],
+            false,
+            None,
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
+        assert_eq!(placements.len(), 1);
+
+        bytes.clear();
+        let same = test_placement(0, 0);
+        encode_graphics_update(
+            &mut bytes,
+            &[same],
+            false,
+            Some(Rect::new(0, 0, 3, 3)),
+            &mut images,
+            &mut placements,
+            &mut sources,
+        );
+        let after = String::from_utf8_lossy(&bytes);
+        assert!(!after.contains("a=p"));
+        assert_eq!(
+            after.matches("a=d,d=i").count(),
+            1,
+            "prior placement is deleted"
+        );
+        assert!(placements.is_empty());
     }
 
     #[test]
@@ -1161,6 +1464,7 @@ mod tests {
             &mut bytes,
             &[placement],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1175,6 +1479,7 @@ mod tests {
             &mut bytes,
             &[same],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1187,6 +1492,7 @@ mod tests {
             &mut bytes,
             &[z_changed],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1201,6 +1507,7 @@ mod tests {
             &mut bytes,
             &[moved],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1222,6 +1529,7 @@ mod tests {
             &mut bytes,
             &[placement],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1234,6 +1542,7 @@ mod tests {
             &mut bytes,
             &[same],
             true,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1254,6 +1563,7 @@ mod tests {
             &mut bytes,
             &[placement],
             false,
+            None,
             &mut cache.images,
             &mut cache.placements,
             &mut cache.sources,
@@ -1267,6 +1577,7 @@ mod tests {
             &mut bytes,
             &[same],
             false,
+            None,
             &mut cache.images,
             &mut cache.placements,
             &mut cache.sources,
@@ -1292,6 +1603,7 @@ mod tests {
             &mut bytes,
             &[placement],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1304,6 +1616,7 @@ mod tests {
             &mut bytes,
             &[scrolled],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1326,6 +1639,7 @@ mod tests {
             &mut bytes,
             &[placement],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1348,6 +1662,7 @@ mod tests {
             &mut bytes,
             &[first],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1364,6 +1679,7 @@ mod tests {
             &mut bytes,
             &[same_image_new_source_id],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1388,6 +1704,7 @@ mod tests {
             &mut bytes,
             &[first],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1404,6 +1721,7 @@ mod tests {
             &mut bytes,
             &[changed],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1441,6 +1759,7 @@ mod tests {
             &mut bytes,
             &[test_placement(0, 0), twin_placement()],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1456,6 +1775,7 @@ mod tests {
             &mut bytes,
             &[changed, twin_placement()],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1488,6 +1808,7 @@ mod tests {
             &mut bytes,
             &[test_placement(0, 0), twin_placement()],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1506,6 +1827,7 @@ mod tests {
             &mut bytes,
             &[changed],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1532,6 +1854,7 @@ mod tests {
             &mut bytes,
             &[placement],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1543,6 +1866,7 @@ mod tests {
             &mut bytes,
             &[],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1564,6 +1888,7 @@ mod tests {
             &mut bytes,
             &[pane_layer_placement(0, 0)],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1575,6 +1900,7 @@ mod tests {
             &mut bytes,
             &[],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1597,6 +1923,7 @@ mod tests {
             &mut bytes,
             &[pane_layer_placement(0, 0)],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1608,6 +1935,7 @@ mod tests {
             &mut bytes,
             &[pane_layer_placement(100, 100)],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1630,6 +1958,7 @@ mod tests {
             &mut bytes,
             &[test_placement(0, 0)],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1641,6 +1970,7 @@ mod tests {
             &mut bytes,
             &[test_placement(100, 100)],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1655,6 +1985,7 @@ mod tests {
             &mut bytes,
             &[changed],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1676,6 +2007,7 @@ mod tests {
             &mut bytes,
             &[pane_layer_placement(0, 0), test_placement(4, 0)],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1687,6 +2019,7 @@ mod tests {
             &mut bytes,
             &[test_placement(4, 0)],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1734,6 +2067,7 @@ mod tests {
             &mut bytes,
             &[placement],
             false,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
@@ -1743,6 +2077,7 @@ mod tests {
             &mut bytes,
             &[],
             true,
+            None,
             &mut images,
             &mut placements,
             &mut sources,
